@@ -1,13 +1,5 @@
-use serde::Deserialize;
 use std::env;
 use std::process::Command;
-
-#[derive(Debug, Deserialize)]
-struct BudgetRow {
-    model: String,
-    #[serde(rename = "weeklyRemaining")]
-    weekly_remaining: String,
-}
 
 #[test]
 fn local_dependencies_are_installed() {
@@ -58,18 +50,31 @@ fn live_json_output_matches_contract() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let rows: Vec<BudgetRow> = serde_json::from_slice(&output.stdout).expect("parse json output");
-    assert_eq!(rows.len(), 2, "expected codex + claude entries");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.trim_start().starts_with('[') && stdout.trim_end().ends_with(']'),
+        "expected JSON array output, got: {stdout}"
+    );
 
-    assert!(rows.iter().any(|r| r.model == "codex"));
-    assert!(rows.iter().any(|r| r.model == "claude"));
+    assert_eq!(
+        stdout.matches("\"model\":\"").count(),
+        2,
+        "expected exactly two model entries"
+    );
+    assert!(stdout.contains("\"model\":\"codex\""));
+    assert!(stdout.contains("\"model\":\"claude\""));
 
-    for row in rows {
+    let weekly_values = extract_weekly_remaining_values(&stdout);
+    assert_eq!(
+        weekly_values.len(),
+        2,
+        "expected two weeklyRemaining values, got: {stdout}"
+    );
+
+    for weekly_remaining in weekly_values {
         assert!(
-            row.weekly_remaining == "??" || looks_like_percentage(&row.weekly_remaining),
-            "unexpected weeklyRemaining for {}: {}",
-            row.model,
-            row.weekly_remaining
+            weekly_remaining == "??" || looks_like_percentage(&weekly_remaining),
+            "unexpected weeklyRemaining value: {weekly_remaining}"
         );
     }
 }
@@ -93,4 +98,22 @@ fn looks_like_percentage(value: &str) -> bool {
     }
 
     number.parse::<u8>().map(|n| n <= 100).unwrap_or(false)
+}
+
+fn extract_weekly_remaining_values(json: &str) -> Vec<String> {
+    let needle = "\"weeklyRemaining\":\"";
+    let mut values = Vec::new();
+    let mut cursor = json;
+
+    while let Some(start) = cursor.find(needle) {
+        let remaining = &cursor[start + needle.len()..];
+        let Some(end) = remaining.find('"') else {
+            break;
+        };
+
+        values.push(remaining[..end].to_string());
+        cursor = &remaining[end + 1..];
+    }
+
+    values
 }

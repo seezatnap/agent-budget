@@ -5,24 +5,32 @@ const CODEX_SCRIPT: &str = r#"
 set -euo pipefail
 
 SESSION="codex_usage_$$"
+SOCKET="/tmp/agent_budget_codex_${SESSION}.sock"
 
-# Start Codex inside tmux
-tmux new-session -d -s "$SESSION" "bash -lc 'codex --dangerously-bypass-approvals-and-sandbox'"
+# Start an interactive shell inside tmux and launch Codex from within it.
+tmux -S "$SOCKET" new-session -d -s "$SESSION" "bash"
 
 # Always clean up the tmux session
-trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true' EXIT
+trap 'tmux -S "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true; rm -f "$SOCKET"' EXIT
+
+tmux -S "$SOCKET" send-keys -t "$SESSION" -l "codex --dangerously-bypass-approvals-and-sandbox"
+tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
 
 sleep 5
 
 # Trigger /status
-tmux bind -n C-j send-keys C-j
-tmux send-keys -t "$SESSION" -l "/status "
-tmux send-keys -t "$SESSION" C-j
-tmux send-keys -t "$SESSION" Enter
+if ! tmux -S "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+  echo "codex tmux session exited before usage capture" >&2
+  exit 1
+fi
+
+tmux -S "$SOCKET" send-keys -t "$SESSION" -l "/status "
+tmux -S "$SOCKET" send-keys -t "$SESSION" C-j
+tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
 
 sleep 5
 
-USAGE_OUTPUT="$(tmux capture-pane -t "$SESSION" -p -J)"
+USAGE_OUTPUT="$(tmux -S "$SOCKET" capture-pane -t "$SESSION" -p -J)"
 USAGE_OUTPUT_CLEAN="$(printf "%s" "$USAGE_OUTPUT" | sed -E "s/\\x1B\\[[0-9;]*[[:alpha:]]//g")"
 
 PROMPT='Determine the percentage REMAINING for the week. return ONLY A PERCENTAGE, i.e. `63%`, NO OTHER TEXT. IF YOU ARE UNSURE, PRINT ??'
@@ -34,22 +42,31 @@ const CLAUDE_SCRIPT: &str = r#"
 set -euo pipefail
 
 SESSION="claude_usage_$$"
+SOCKET="/tmp/agent_budget_claude_${SESSION}.sock"
 
-# Start Claude inside tmux
-tmux new-session -d -s "$SESSION" "bash -lc 'IS_SANDBOX=1 claude --dangerously-skip-permissions'"
+# Start an interactive shell inside tmux and launch Claude from within it.
+tmux -S "$SOCKET" new-session -d -s "$SESSION" "bash"
 
 # Always clean up the tmux session
-trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true' EXIT
+trap 'tmux -S "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true; rm -f "$SOCKET"' EXIT
+
+tmux -S "$SOCKET" send-keys -t "$SESSION" -l "IS_SANDBOX=1 claude --dangerously-skip-permissions"
+tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
 
 sleep 5
 
 # Trigger /usage
-tmux send-keys -t "$SESSION" -l "/usage"
-tmux send-keys -t "$SESSION" Enter
+if ! tmux -S "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+  echo "claude tmux session exited before usage capture" >&2
+  exit 1
+fi
+
+tmux -S "$SOCKET" send-keys -t "$SESSION" -l "/usage"
+tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
 sleep 5
 
 # Capture output
-USAGE_OUTPUT="$(tmux capture-pane -t "$SESSION" -p -J)"
+USAGE_OUTPUT="$(tmux -S "$SOCKET" capture-pane -t "$SESSION" -p -J)"
 
 # Strip ANSI escapes (optional but helps)
 USAGE_OUTPUT_CLEAN="$(printf "%s" "$USAGE_OUTPUT" | perl -pe "s/\\e\\[[0-9;]*[A-Za-z]//g")"
@@ -64,6 +81,7 @@ struct BudgetRow {
     weekly_remaining: String,
 }
 
+#[derive(Debug)]
 enum OutputMode {
     Text,
     Json,
