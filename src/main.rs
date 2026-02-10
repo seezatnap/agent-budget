@@ -1,17 +1,27 @@
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CODEX_SCRIPT: &str = r#"
 set -euo pipefail
 
 SESSION="codex_usage_$$"
 SOCKET="/tmp/agent_budget_codex_${SESSION}.sock"
+DEBUG_DIR="${AGENT_BUDGET_DEBUG_DIR:-}"
+MODEL="codex"
 
 # Start an interactive shell inside tmux and launch Codex from within it.
 tmux -S "$SOCKET" new-session -d -s "$SESSION" "bash"
 
 # Always clean up the tmux session
 trap 'tmux -S "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true; rm -f "$SOCKET"' EXIT
+
+if [ -n "$DEBUG_DIR" ]; then
+  mkdir -p "$DEBUG_DIR"
+  printf "%s\n" "$SOCKET" > "$DEBUG_DIR/${MODEL}_tmux_socket.txt"
+fi
 
 tmux -S "$SOCKET" send-keys -t "$SESSION" -l "codex --dangerously-bypass-approvals-and-sandbox"
 tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
@@ -34,46 +44,74 @@ USAGE_OUTPUT="$(tmux -S "$SOCKET" capture-pane -t "$SESSION" -p -J)"
 USAGE_OUTPUT_CLEAN="$(printf "%s" "$USAGE_OUTPUT" | sed -E "s/\\x1B\\[[0-9;]*[[:alpha:]]//g")"
 
 PROMPT='Determine the percentage REMAINING for the week. return ONLY A PERCENTAGE, i.e. `63%`, NO OTHER TEXT. IF YOU ARE UNSURE, PRINT ??'
+FINAL_PROMPT="$(printf "%s\n\n%s" "$PROMPT" "$USAGE_OUTPUT_CLEAN")"
 
-claude -p "$(printf "%s\\n\\n%s" "$PROMPT" "$USAGE_OUTPUT_CLEAN")"
+if [ -n "$DEBUG_DIR" ]; then
+  printf "%s" "$USAGE_OUTPUT" > "$DEBUG_DIR/${MODEL}_tmux_capture_raw.txt"
+  printf "%s" "$USAGE_OUTPUT_CLEAN" > "$DEBUG_DIR/${MODEL}_tmux_capture_clean.txt"
+  printf "%s" "$FINAL_PROMPT" > "$DEBUG_DIR/${MODEL}_llm_prompt.txt"
+fi
+
+RESULT="$(claude -p "$FINAL_PROMPT")"
+
+if [ -n "$DEBUG_DIR" ]; then
+  printf "%s" "$RESULT" > "$DEBUG_DIR/${MODEL}_llm_response.txt"
+fi
+
+printf "%s\n" "$RESULT"
 "#;
 
 const CLAUDE_SCRIPT: &str = r#"
 set -euo pipefail
 
 SESSION="claude_usage_$$"
-SOCKET="/tmp/agent_budget_claude_${SESSION}.sock"
+DEBUG_DIR="${AGENT_BUDGET_DEBUG_DIR:-}"
+MODEL="claude"
 
-# Start an interactive shell inside tmux and launch Claude from within it.
-tmux -S "$SOCKET" new-session -d -s "$SESSION" "bash"
+# Start Claude inside tmux
+tmux new-session -d -s "$SESSION" "bash -lc 'IS_SANDBOX=1 claude --dangerously-skip-permissions'"
 
 # Always clean up the tmux session
-trap 'tmux -S "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true; rm -f "$SOCKET"' EXIT
+trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true' EXIT
 
-tmux -S "$SOCKET" send-keys -t "$SESSION" -l "IS_SANDBOX=1 claude --dangerously-skip-permissions"
-tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
+if [ -n "$DEBUG_DIR" ]; then
+  mkdir -p "$DEBUG_DIR"
+fi
 
 sleep 5
 
 # Trigger /usage
-if ! tmux -S "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "claude tmux session exited before usage capture" >&2
   exit 1
 fi
 
-tmux -S "$SOCKET" send-keys -t "$SESSION" -l "/usage"
-tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
+tmux send-keys -t "$SESSION" -l "/usage"
+tmux send-keys -t "$SESSION" Enter
 sleep 5
 
 # Capture output
-USAGE_OUTPUT="$(tmux -S "$SOCKET" capture-pane -t "$SESSION" -p -J)"
+USAGE_OUTPUT="$(tmux capture-pane -t "$SESSION" -p -J)"
 
 # Strip ANSI escapes (optional but helps)
-USAGE_OUTPUT_CLEAN="$(printf "%s" "$USAGE_OUTPUT" | perl -pe "s/\\e\\[[0-9;]*[A-Za-z]//g")"
+USAGE_OUTPUT_CLEAN="$(printf "%s" "$USAGE_OUTPUT" | perl -pe "s/\e\[[0-9;]*[A-Za-z]//g")"
 
 PROMPT='Determine the percentage REMAINING for the week. return ONLY A PERCENTAGE, i.e. `63%`, NO OTHER TEXT. IF YOU ARE UNSURE, PRINT ??'
+FINAL_PROMPT="$(printf "%s\n\n%s" "$PROMPT" "$USAGE_OUTPUT_CLEAN")"
 
-exec claude -p "$(printf "%s\\n\\n%s" "$PROMPT" "$USAGE_OUTPUT_CLEAN")"
+if [ -n "$DEBUG_DIR" ]; then
+  printf "%s" "$USAGE_OUTPUT" > "$DEBUG_DIR/${MODEL}_tmux_capture_raw.txt"
+  printf "%s" "$USAGE_OUTPUT_CLEAN" > "$DEBUG_DIR/${MODEL}_tmux_capture_clean.txt"
+  printf "%s" "$FINAL_PROMPT" > "$DEBUG_DIR/${MODEL}_llm_prompt.txt"
+fi
+
+RESULT="$(claude -p "$FINAL_PROMPT")"
+
+if [ -n "$DEBUG_DIR" ]; then
+  printf "%s" "$RESULT" > "$DEBUG_DIR/${MODEL}_llm_response.txt"
+fi
+
+printf "%s\n" "$RESULT"
 "#;
 
 struct BudgetRow {
@@ -87,6 +125,12 @@ enum OutputMode {
     Json,
 }
 
+#[derive(Debug)]
+struct CliFlags {
+    mode: OutputMode,
+    debug: bool,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -98,10 +142,19 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    let mode = parse_args(env::args().skip(1))?;
+    let flags = parse_args(env::args().skip(1))?;
+    let debug_dir = if flags.debug {
+        Some(create_debug_dir()?)
+    } else {
+        None
+    };
 
-    let codex_remaining = run_usage_script(CODEX_SCRIPT)?;
-    let claude_remaining = run_usage_script(CLAUDE_SCRIPT)?;
+    if let Some(dir) = &debug_dir {
+        eprintln!("agent-budget debug dir: {}", dir.display());
+    }
+
+    let codex_remaining = run_usage_script("codex", CODEX_SCRIPT, debug_dir.as_deref())?;
+    let claude_remaining = run_usage_script("claude", CLAUDE_SCRIPT, debug_dir.as_deref())?;
 
     let rows = [
         BudgetRow {
@@ -114,7 +167,7 @@ fn run() -> Result<(), String> {
         },
     ];
 
-    match mode {
+    match flags.mode {
         OutputMode::Json => {
             let json = render_json(&rows);
             println!("{json}");
@@ -129,15 +182,17 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn parse_args<I>(args: I) -> Result<OutputMode, String>
+fn parse_args<I>(args: I) -> Result<CliFlags, String>
 where
     I: IntoIterator<Item = String>,
 {
     let mut mode = OutputMode::Text;
+    let mut debug = false;
 
     for arg in args {
         match arg.as_str() {
             "--json" => mode = OutputMode::Json,
+            "--debug" => debug = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -146,26 +201,36 @@ where
         }
     }
 
-    Ok(mode)
+    Ok(CliFlags { mode, debug })
 }
 
 fn print_help() {
     println!("agent-budget");
     println!();
     println!("Usage:");
-    println!("  agent-budget [--json]");
+    println!("  agent-budget [--json] [--debug]");
     println!();
     println!("Options:");
     println!("  --json       Print results as JSON");
+    println!("  --debug      Write debug artifacts to /tmp and print that path to stderr");
     println!("  -h, --help   Print help");
 }
 
-fn run_usage_script(script: &str) -> Result<String, String> {
-    let output = Command::new("bash")
-        .arg("-lc")
-        .arg(script)
+fn run_usage_script(model: &str, script: &str, debug_dir: Option<&Path>) -> Result<String, String> {
+    let mut command = Command::new("bash");
+    command.arg("-lc").arg(script);
+
+    if let Some(dir) = debug_dir {
+        command.env("AGENT_BUDGET_DEBUG_DIR", dir);
+    }
+
+    let output = command
         .output()
         .map_err(|e| format!("failed to run bash: {e}"))?;
+
+    if let Some(dir) = debug_dir {
+        write_debug_output(dir, model, &output, script)?;
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -176,6 +241,53 @@ fn run_usage_script(script: &str) -> Result<String, String> {
 
     let raw = String::from_utf8_lossy(&output.stdout);
     Ok(extract_percentage(&raw))
+}
+
+fn create_debug_dir() -> Result<PathBuf, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("failed to get system time: {e}"))?
+        .as_millis();
+    let pid = std::process::id();
+    let dir = PathBuf::from(format!("/tmp/agent-budget-debug-{now}-{pid}"));
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create debug dir {dir:?}: {e}"))?;
+    Ok(dir)
+}
+
+fn write_debug_output(
+    debug_dir: &Path,
+    model: &str,
+    output: &std::process::Output,
+    script: &str,
+) -> Result<(), String> {
+    write_debug_file(debug_dir, model, "runner_stdout.txt", &output.stdout)?;
+    write_debug_file(debug_dir, model, "runner_stderr.txt", &output.stderr)?;
+    write_debug_file(debug_dir, model, "script.sh", script.as_bytes())?;
+
+    let status_text = if let Some(code) = output.status.code() {
+        format!("exit_code={code}\n")
+    } else {
+        "exit_code=signal\n".to_string()
+    };
+    write_debug_file(
+        debug_dir,
+        model,
+        "runner_status.txt",
+        status_text.as_bytes(),
+    )?;
+
+    Ok(())
+}
+
+fn write_debug_file(
+    debug_dir: &Path,
+    model: &str,
+    suffix: &str,
+    contents: &[u8],
+) -> Result<(), String> {
+    let path = debug_dir.join(format!("{model}_{suffix}"));
+    fs::write(&path, contents)
+        .map_err(|e| format!("failed to write debug file {}: {e}", path.display()))
 }
 
 fn extract_percentage(raw: &str) -> String {
@@ -268,14 +380,31 @@ mod tests {
 
     #[test]
     fn parse_args_defaults_to_text() {
-        let mode = parse_args(Vec::<String>::new()).expect("parse succeeds");
-        assert!(matches!(mode, OutputMode::Text));
+        let flags = parse_args(Vec::<String>::new()).expect("parse succeeds");
+        assert!(matches!(flags.mode, OutputMode::Text));
+        assert!(!flags.debug);
     }
 
     #[test]
     fn parse_args_supports_json() {
-        let mode = parse_args(vec!["--json".to_string()]).expect("parse succeeds");
-        assert!(matches!(mode, OutputMode::Json));
+        let flags = parse_args(vec!["--json".to_string()]).expect("parse succeeds");
+        assert!(matches!(flags.mode, OutputMode::Json));
+        assert!(!flags.debug);
+    }
+
+    #[test]
+    fn parse_args_supports_debug() {
+        let flags = parse_args(vec!["--debug".to_string()]).expect("parse succeeds");
+        assert!(matches!(flags.mode, OutputMode::Text));
+        assert!(flags.debug);
+    }
+
+    #[test]
+    fn parse_args_supports_json_and_debug() {
+        let flags =
+            parse_args(vec!["--json".to_string(), "--debug".to_string()]).expect("parse succeeds");
+        assert!(matches!(flags.mode, OutputMode::Json));
+        assert!(flags.debug);
     }
 
     #[test]
