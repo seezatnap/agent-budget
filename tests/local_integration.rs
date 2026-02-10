@@ -64,17 +64,31 @@ fn live_json_output_matches_contract() {
     assert!(stdout.contains("\"model\":\"codex\""));
     assert!(stdout.contains("\"model\":\"claude\""));
 
-    let weekly_values = extract_weekly_remaining_values(&stdout);
+    let weekly_values = extract_values_for_key(&stdout, "weeklyLimit");
     assert_eq!(
         weekly_values.len(),
         2,
-        "expected two weeklyRemaining values, got: {stdout}"
+        "expected two weeklyLimit values, got: {stdout}"
     );
 
-    for weekly_remaining in weekly_values {
+    for weekly_limit in weekly_values {
         assert!(
-            weekly_remaining == "??" || looks_like_percentage(&weekly_remaining),
-            "unexpected weeklyRemaining value: {weekly_remaining}"
+            weekly_limit == "??" || looks_like_percentage(&weekly_limit),
+            "unexpected weeklyLimit value: {weekly_limit}"
+        );
+    }
+
+    let short_term_values = extract_values_for_key(&stdout, "shortTermLimit");
+    assert_eq!(
+        short_term_values.len(),
+        2,
+        "expected two shortTermLimit values, got: {stdout}"
+    );
+
+    for short_term_limit in short_term_values {
+        assert!(
+            short_term_limit == "??" || looks_like_percentage(&short_term_limit),
+            "unexpected shortTermLimit value: {short_term_limit}"
         );
     }
 }
@@ -100,12 +114,12 @@ fn looks_like_percentage(value: &str) -> bool {
     number.parse::<u8>().map(|n| n <= 100).unwrap_or(false)
 }
 
-fn extract_weekly_remaining_values(json: &str) -> Vec<String> {
-    let needle = "\"weeklyRemaining\":\"";
+fn extract_values_for_key(json: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\":\"");
     let mut values = Vec::new();
     let mut cursor = json;
 
-    while let Some(start) = cursor.find(needle) {
+    while let Some(start) = cursor.find(&needle) {
         let remaining = &cursor[start + needle.len()..];
         let Some(end) = remaining.find('"') else {
             break;

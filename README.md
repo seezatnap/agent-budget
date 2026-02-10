@@ -35,7 +35,7 @@ agent-budget --json --debug
 ## Output shape (`--json`)
 
 ```json
-[{"model":"codex","weeklyRemaining":"50%"},{"model":"claude","weeklyRemaining":"32%"}]
+[{"model":"codex","weeklyLimit":"50%","shortTermLimit":"14%"},{"model":"claude","weeklyLimit":"32%","shortTermLimit":"9%"}]
 ```
 
 ## Tests

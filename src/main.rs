@@ -43,7 +43,7 @@ sleep 5
 USAGE_OUTPUT="$(tmux -S "$SOCKET" capture-pane -t "$SESSION" -p -J)"
 USAGE_OUTPUT_CLEAN="$(printf "%s" "$USAGE_OUTPUT" | sed -E "s/\\x1B\\[[0-9;]*[[:alpha:]]//g")"
 
-PROMPT='Determine the percentage REMAINING for the week. return ONLY A PERCENTAGE, i.e. `63%`, NO OTHER TEXT. IF YOU ARE UNSURE, PRINT ??'
+PROMPT='Extract the remaining usage percentages for both weekly and short-term limits. Return JSON ONLY in this exact shape: {"weeklyLimit":"63%","shortTermLimit":"12%"}. Use "??" for unknown values.'
 FINAL_PROMPT="$(printf "%s\n\n%s" "$PROMPT" "$USAGE_OUTPUT_CLEAN")"
 
 if [ -n "$DEBUG_DIR" ]; then
@@ -96,7 +96,7 @@ USAGE_OUTPUT="$(tmux capture-pane -t "$SESSION" -p -J)"
 # Strip ANSI escapes (optional but helps)
 USAGE_OUTPUT_CLEAN="$(printf "%s" "$USAGE_OUTPUT" | perl -pe "s/\e\[[0-9;]*[A-Za-z]//g")"
 
-PROMPT='Determine the percentage REMAINING for the week. return ONLY A PERCENTAGE, i.e. `63%`, NO OTHER TEXT. IF YOU ARE UNSURE, PRINT ??'
+PROMPT='Extract the remaining usage percentages for both weekly and short-term limits. Return JSON ONLY in this exact shape: {"weeklyLimit":"63%","shortTermLimit":"12%"}. Use "??" for unknown values.'
 FINAL_PROMPT="$(printf "%s\n\n%s" "$PROMPT" "$USAGE_OUTPUT_CLEAN")"
 
 if [ -n "$DEBUG_DIR" ]; then
@@ -116,7 +116,14 @@ printf "%s\n" "$RESULT"
 
 struct BudgetRow {
     model: &'static str,
-    weekly_remaining: String,
+    weekly_limit: String,
+    short_term_limit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageLimits {
+    weekly_limit: String,
+    short_term_limit: String,
 }
 
 #[derive(Debug)]
@@ -153,17 +160,19 @@ fn run() -> Result<(), String> {
         eprintln!("agent-budget debug dir: {}", dir.display());
     }
 
-    let codex_remaining = run_usage_script("codex", CODEX_SCRIPT, debug_dir.as_deref())?;
-    let claude_remaining = run_usage_script("claude", CLAUDE_SCRIPT, debug_dir.as_deref())?;
+    let codex_limits = run_usage_script("codex", CODEX_SCRIPT, debug_dir.as_deref())?;
+    let claude_limits = run_usage_script("claude", CLAUDE_SCRIPT, debug_dir.as_deref())?;
 
     let rows = [
         BudgetRow {
             model: "codex",
-            weekly_remaining: codex_remaining,
+            weekly_limit: codex_limits.weekly_limit,
+            short_term_limit: codex_limits.short_term_limit,
         },
         BudgetRow {
             model: "claude",
-            weekly_remaining: claude_remaining,
+            weekly_limit: claude_limits.weekly_limit,
+            short_term_limit: claude_limits.short_term_limit,
         },
     ];
 
@@ -174,7 +183,10 @@ fn run() -> Result<(), String> {
         }
         OutputMode::Text => {
             for row in rows {
-                println!("{} weekly remaining: {}", row.model, row.weekly_remaining);
+                println!(
+                    "{} weekly limit: {}, short-term limit: {}",
+                    row.model, row.weekly_limit, row.short_term_limit
+                );
             }
         }
     }
@@ -216,7 +228,11 @@ fn print_help() {
     println!("  -h, --help   Print help");
 }
 
-fn run_usage_script(model: &str, script: &str, debug_dir: Option<&Path>) -> Result<String, String> {
+fn run_usage_script(
+    model: &str,
+    script: &str,
+    debug_dir: Option<&Path>,
+) -> Result<UsageLimits, String> {
     let mut command = Command::new("bash");
     command.arg("-lc").arg(script);
 
@@ -240,7 +256,7 @@ fn run_usage_script(model: &str, script: &str, debug_dir: Option<&Path>) -> Resu
     }
 
     let raw = String::from_utf8_lossy(&output.stdout);
-    Ok(extract_percentage(&raw))
+    Ok(extract_limits(&raw))
 }
 
 fn create_debug_dir() -> Result<PathBuf, String> {
@@ -290,29 +306,104 @@ fn write_debug_file(
         .map_err(|e| format!("failed to write debug file {}: {e}", path.display()))
 }
 
-fn extract_percentage(raw: &str) -> String {
-    for token in raw.split_whitespace().rev() {
-        let candidate =
-            token.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '%' || c == '?'));
+fn extract_limits(raw: &str) -> UsageLimits {
+    let weekly_limit = extract_keyed_percentage(raw, &["weeklyLimit", "weeklyLImit"])
+        .or_else(|| extract_last_percentage(raw))
+        .unwrap_or_else(|| "??".to_string());
+    let short_term_limit =
+        extract_keyed_percentage(raw, &["shortTermLimit"]).unwrap_or_else(|| "??".to_string());
 
-        if candidate == "??" {
-            return "??".to_string();
-        }
+    UsageLimits {
+        weekly_limit,
+        short_term_limit,
+    }
+}
 
-        if let Some(number) = candidate.strip_suffix('%') {
-            if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
-
-            if let Ok(value) = number.parse::<u8>() {
-                if value <= 100 {
-                    return format!("{value}%");
-                }
-            }
+fn extract_keyed_percentage(raw: &str, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = extract_percentage_for_key(raw, key) {
+            return Some(value);
         }
     }
 
-    "??".to_string()
+    None
+}
+
+fn extract_percentage_for_key(raw: &str, key: &str) -> Option<String> {
+    let double_quoted = format!("\"{key}\"");
+    let single_quoted = format!("'{key}'");
+
+    for needle in [double_quoted.as_str(), single_quoted.as_str(), key] {
+        let mut cursor = raw;
+
+        while let Some(start) = cursor.find(needle) {
+            let remaining = &cursor[start + needle.len()..];
+
+            if let Some(value) = extract_percentage_after_colon(remaining) {
+                return Some(value);
+            }
+
+            if remaining.is_empty() {
+                break;
+            }
+            cursor = &remaining[1..];
+        }
+    }
+
+    None
+}
+
+fn extract_percentage_after_colon(input: &str) -> Option<String> {
+    let colon = input.find(':')?;
+    let value = input[colon + 1..].trim_start();
+
+    if value.is_empty() {
+        return None;
+    }
+
+    let candidate = if let Some(rest) = value.strip_prefix('"') {
+        &rest[..rest.find('"')?]
+    } else if let Some(rest) = value.strip_prefix('\'') {
+        &rest[..rest.find('\'')?]
+    } else {
+        let end = value
+            .find(|c: char| c == ',' || c == '}' || c.is_ascii_whitespace())
+            .unwrap_or(value.len());
+        &value[..end]
+    };
+
+    normalize_percentage(candidate)
+}
+
+fn extract_last_percentage(raw: &str) -> Option<String> {
+    for token in raw.split_whitespace().rev() {
+        if let Some(value) = normalize_percentage(token) {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+fn normalize_percentage(input: &str) -> Option<String> {
+    let candidate =
+        input.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '%' || c == '?'));
+
+    if candidate == "??" {
+        return Some("??".to_string());
+    }
+
+    let number = candidate.strip_suffix('%')?;
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    let value = number.parse::<u8>().ok()?;
+    if value > 100 {
+        return None;
+    }
+
+    Some(format!("{value}%"))
 }
 
 fn render_json(rows: &[BudgetRow]) -> String {
@@ -325,8 +416,10 @@ fn render_json(rows: &[BudgetRow]) -> String {
 
         out.push_str("{\"model\":\"");
         out.push_str(&json_escape(row.model));
-        out.push_str("\",\"weeklyRemaining\":\"");
-        out.push_str(&json_escape(&row.weekly_remaining));
+        out.push_str("\",\"weeklyLimit\":\"");
+        out.push_str(&json_escape(&row.weekly_limit));
+        out.push_str("\",\"shortTermLimit\":\"");
+        out.push_str(&json_escape(&row.short_term_limit));
         out.push_str("\"}");
     }
 
@@ -356,26 +449,52 @@ fn json_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BudgetRow, OutputMode, extract_percentage, json_escape, parse_args, render_json};
+    use super::{
+        BudgetRow, OutputMode, UsageLimits, extract_limits, json_escape, parse_args, render_json,
+    };
 
     #[test]
-    fn extracts_clean_percentage() {
-        assert_eq!(extract_percentage("63%\n"), "63%");
+    fn extracts_limits_from_json() {
+        assert_eq!(
+            extract_limits(r#"{"weeklyLimit":"63%","shortTermLimit":"18%"}"#),
+            UsageLimits {
+                weekly_limit: "63%".to_string(),
+                short_term_limit: "18%".to_string(),
+            }
+        );
     }
 
     #[test]
-    fn extracts_percentage_from_extra_text() {
-        assert_eq!(extract_percentage("result: 42% done"), "42%");
+    fn extracts_limits_with_unknowns() {
+        assert_eq!(
+            extract_limits(r#"{"weeklyLimit":"??","shortTermLimit":"??"}"#),
+            UsageLimits {
+                weekly_limit: "??".to_string(),
+                short_term_limit: "??".to_string(),
+            }
+        );
     }
 
     #[test]
-    fn returns_unknown_for_invalid_values() {
-        assert_eq!(extract_percentage("150%"), "??");
+    fn extracts_weekly_limit_with_legacy_typo_key() {
+        assert_eq!(
+            extract_limits(r#"{"weeklyLImit":"41%","shortTermLimit":"11%"}"#),
+            UsageLimits {
+                weekly_limit: "41%".to_string(),
+                short_term_limit: "11%".to_string(),
+            }
+        );
     }
 
     #[test]
-    fn supports_explicit_unknown() {
-        assert_eq!(extract_percentage("??"), "??");
+    fn falls_back_to_single_percentage_for_weekly_limit() {
+        assert_eq!(
+            extract_limits("result: 42%"),
+            UsageLimits {
+                weekly_limit: "42%".to_string(),
+                short_term_limit: "??".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -418,17 +537,19 @@ mod tests {
         let rows = [
             BudgetRow {
                 model: "codex",
-                weekly_remaining: "63%".to_string(),
+                weekly_limit: "63%".to_string(),
+                short_term_limit: "18%".to_string(),
             },
             BudgetRow {
                 model: "claude",
-                weekly_remaining: "??".to_string(),
+                weekly_limit: "??".to_string(),
+                short_term_limit: "7%".to_string(),
             },
         ];
 
         assert_eq!(
             render_json(&rows),
-            r#"[{"model":"codex","weeklyRemaining":"63%"},{"model":"claude","weeklyRemaining":"??"}]"#
+            r#"[{"model":"codex","weeklyLimit":"63%","shortTermLimit":"18%"},{"model":"claude","weeklyLimit":"??","shortTermLimit":"7%"}]"#
         );
     }
 
