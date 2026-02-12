@@ -70,7 +70,7 @@ DEBUG_DIR="${AGENT_BUDGET_DEBUG_DIR:-}"
 MODEL="claude"
 
 # Start Claude inside tmux
-tmux -S "$SOCKET" new-session -d -s "$SESSION" "bash -lc 'IS_SANDBOX=1 claude --dangerously-skip-permissions'"
+tmux -S "$SOCKET" new-session -d -s "$SESSION" "bash"
 
 # Always clean up the tmux session
 trap 'tmux -S "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true; rm -f "$SOCKET"' EXIT
@@ -79,6 +79,9 @@ if [ -n "$DEBUG_DIR" ]; then
   mkdir -p "$DEBUG_DIR"
   printf "%s\n" "$SOCKET" > "$DEBUG_DIR/${MODEL}_tmux_socket.txt"
 fi
+
+tmux -S "$SOCKET" send-keys -t "$SESSION" -l "IS_SANDBOX=1 claude --dangerously-skip-permissions"
+tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
 
 sleep 5
 
