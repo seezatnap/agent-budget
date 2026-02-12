@@ -65,33 +65,35 @@ const CLAUDE_SCRIPT: &str = r#"
 set -euo pipefail
 
 SESSION="claude_usage_$$"
+SOCKET="/tmp/agent_budget_claude_${SESSION}.sock"
 DEBUG_DIR="${AGENT_BUDGET_DEBUG_DIR:-}"
 MODEL="claude"
 
 # Start Claude inside tmux
-tmux new-session -d -s "$SESSION" "bash -lc 'IS_SANDBOX=1 claude --dangerously-skip-permissions'"
+tmux -S "$SOCKET" new-session -d -s "$SESSION" "bash -lc 'IS_SANDBOX=1 claude --dangerously-skip-permissions'"
 
 # Always clean up the tmux session
-trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true' EXIT
+trap 'tmux -S "$SOCKET" kill-session -t "$SESSION" 2>/dev/null || true; rm -f "$SOCKET"' EXIT
 
 if [ -n "$DEBUG_DIR" ]; then
   mkdir -p "$DEBUG_DIR"
+  printf "%s\n" "$SOCKET" > "$DEBUG_DIR/${MODEL}_tmux_socket.txt"
 fi
 
 sleep 5
 
 # Trigger /usage
-if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+if ! tmux -S "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
   echo "claude tmux session exited before usage capture" >&2
   exit 1
 fi
 
-tmux send-keys -t "$SESSION" -l "/usage"
-tmux send-keys -t "$SESSION" Enter
+tmux -S "$SOCKET" send-keys -t "$SESSION" -l "/usage"
+tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
 sleep 5
 
 # Capture output
-USAGE_OUTPUT="$(tmux capture-pane -t "$SESSION" -p -J)"
+USAGE_OUTPUT="$(tmux -S "$SOCKET" capture-pane -t "$SESSION" -p -J)"
 
 # Strip ANSI escapes (optional but helps)
 USAGE_OUTPUT_CLEAN="$(printf "%s" "$USAGE_OUTPUT" | perl -pe "s/\e\[[0-9;]*[A-Za-z]//g")"
