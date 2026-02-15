@@ -80,17 +80,25 @@ if [ -n "$DEBUG_DIR" ]; then
   printf "%s\n" "$SOCKET" > "$DEBUG_DIR/${MODEL}_tmux_socket.txt"
 fi
 
-tmux -S "$SOCKET" send-keys -t "$SESSION" -l "IS_SANDBOX=1 claude --dangerously-skip-permissions"
+tmux -S "$SOCKET" send-keys -t "$SESSION" -l "IS_SANDBOX=1 claude --permission-mode bypassPermissions"
 tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
 
 sleep 5
 
-# Trigger /usage
 if ! tmux -S "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
   echo "claude tmux session exited before usage capture" >&2
   exit 1
 fi
 
+# Legacy Claude builds may still show a bypass-mode confirmation screen.
+STARTUP_OUTPUT="$(tmux -S "$SOCKET" capture-pane -t "$SESSION" -p -J)"
+if printf "%s" "$STARTUP_OUTPUT" | grep -qi "Bypass Permissions mode"; then
+  tmux -S "$SOCKET" send-keys -t "$SESSION" -l "2"
+  tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
+  sleep 4
+fi
+
+# Trigger /usage
 tmux -S "$SOCKET" send-keys -t "$SESSION" -l "/usage"
 tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
 sleep 5
