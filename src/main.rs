@@ -80,7 +80,7 @@ if [ -n "$DEBUG_DIR" ]; then
   printf "%s\n" "$SOCKET" > "$DEBUG_DIR/${MODEL}_tmux_socket.txt"
 fi
 
-tmux -S "$SOCKET" send-keys -t "$SESSION" -l "IS_SANDBOX=1 claude --permission-mode bypassPermissions"
+tmux -S "$SOCKET" send-keys -t "$SESSION" -l "IS_SANDBOX=1 claude --allow-dangerously-skip-permissions --dangerously-skip-permissions"
 tmux -S "$SOCKET" send-keys -t "$SESSION" Enter
 
 sleep 5
@@ -90,7 +90,7 @@ if ! tmux -S "$SOCKET" has-session -t "$SESSION" 2>/dev/null; then
   exit 1
 fi
 
-# Legacy Claude builds may still show a bypass-mode confirmation screen.
+# Newer Claude builds may show a bypass-mode confirmation screen.
 STARTUP_OUTPUT="$(tmux -S "$SOCKET" capture-pane -t "$SESSION" -p -J)"
 if printf "%s" "$STARTUP_OUTPUT" | grep -qi "Bypass Permissions mode"; then
   tmux -S "$SOCKET" send-keys -t "$SESSION" -l "2"
